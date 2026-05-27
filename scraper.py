@@ -169,6 +169,37 @@ def get_download_links(detail_url: str, client: httpx.Client = None) -> List[dic
     return files
 
 
+def _detect_format(data: bytes, content_type: str, hint: str) -> str:
+    """
+    Určí skutečný formát souboru podle content-type a magic bytes.
+    Hint je formát odhadnutý z názvu souboru - použije se jako fallback.
+    """
+    ct = content_type.lower()
+
+    # PDF magic bytes
+    if data[:4] == b"%PDF":
+        return "pdf"
+
+    # ZIP (XBRL archiv)
+    if data[:2] == b"PK":
+        return "xbrl"
+
+    # XML/XHTML - rozlišit iXBRL od čistého XBRL
+    stripped = data.lstrip(b"\xef\xbb\xbf").strip()
+    if stripped.startswith(b"<?xml") or stripped.startswith(b"<"):
+        if b"nonFraction" in data or b"nonNumeric" in data:
+            return "ixbrl"
+        return "xml"
+
+    # Content-type fallback
+    if "pdf" in ct:
+        return "pdf"
+    if "xhtml" in ct or "xml" in ct:
+        return "ixbrl" if b"nonFraction" in data else "xml"
+
+    return hint
+
+
 def download_zaverka(zaverka: dict) -> Tuple[bytes, str, str]:
     """
     Kompletní flow: detail → soubory → stažení v rámci jedné session.
@@ -212,21 +243,22 @@ def download_zaverka(zaverka: dict) -> Tuple[bytes, str, str]:
         data = r_file.content
         ct = r_file.headers.get("content-type", "")
 
-        # Ověřit, že nejsme na HTML chybové stránce
+        # Ověřit, že nejsme na HTML chybové stránce (justice.cz throttling)
         if "text/html" in ct and len(data) < 50_000:
-            # Justice.cz nás posílá na HTML stránku místo souboru - zkusit fallback na PDF
             if xbrl and pdf:
                 r_file = client.get(pdf[0]["url"], timeout=120)
                 r_file.raise_for_status()
                 data = r_file.content
                 ct = r_file.headers.get("content-type", "")
                 chosen = pdf[0]
-            elif "text/html" in ct:
+            else:
                 raise ValueError(
                     "Justice.cz odmítlo stažení souboru (pravděpodobně throttling). Zkus znovu."
                 )
 
-        return data, ct, chosen["format"]
+        # Určit skutečný formát podle content-type a obsahu - ne podle jména souboru
+        actual_fmt = _detect_format(data, ct, chosen["format"])
+        return data, ct, actual_fmt
 
 
 def extract_xbrl_from_zip(data: bytes) -> List[Tuple[str, bytes]]:
