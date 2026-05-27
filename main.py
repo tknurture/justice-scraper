@@ -126,7 +126,14 @@ def get_vykazy(
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'},
                 )
 
-    # PDF (nebo XBRL neparsovatelný) → vrátit přímo
+    # PDF → ověřit magic bytes před odesláním
+    if data[:4] != b"%PDF":
+        raise HTTPException(
+            502,
+            detail=f"Justice.cz nevrátilo platný PDF soubor (obdrženo {len(data)} bytes, "
+                   f"content-type: {ct}). Zkus znovu."
+        )
+
     filename = f"zaverka_{ico}_{zaverka['year']}.pdf"
     return StreamingResponse(
         io.BytesIO(data),

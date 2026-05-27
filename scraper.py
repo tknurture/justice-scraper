@@ -171,12 +171,10 @@ def get_download_links(detail_url: str, client: httpx.Client = None) -> List[dic
 
 def _detect_format(data: bytes, content_type: str, hint: str) -> str:
     """
-    Určí skutečný formát souboru podle content-type a magic bytes.
-    Hint je formát odhadnutý z názvu souboru - použije se jako fallback.
+    Určí skutečný formát podle magic bytes - jediný spolehlivý způsob.
+    Pokud data vypadají jako HTML (chybová stránka), vrátí 'html_error'.
     """
-    ct = content_type.lower()
-
-    # PDF magic bytes
+    # PDF magic bytes - nejvyšší priorita
     if data[:4] == b"%PDF":
         return "pdf"
 
@@ -184,18 +182,16 @@ def _detect_format(data: bytes, content_type: str, hint: str) -> str:
     if data[:2] == b"PK":
         return "xbrl"
 
-    # XML/XHTML - rozlišit iXBRL od čistého XBRL
+    # XML nebo HTML
     stripped = data.lstrip(b"\xef\xbb\xbf").strip()
     if stripped.startswith(b"<?xml") or stripped.startswith(b"<"):
+        # iXBRL má nonFraction elementy
         if b"nonFraction" in data or b"nonNumeric" in data:
             return "ixbrl"
+        # HTML chybová stránka z justice.cz
+        if stripped.startswith(b"<!DOCTYPE") or stripped.startswith(b"<html"):
+            return "html_error"
         return "xml"
-
-    # Content-type fallback
-    if "pdf" in ct:
-        return "pdf"
-    if "xhtml" in ct or "xml" in ct:
-        return "ixbrl" if b"nonFraction" in data else "xml"
 
     return hint
 
@@ -237,27 +233,30 @@ def download_zaverka(zaverka: dict) -> Tuple[bytes, str, str]:
         pdf = [f for f in files if f["format"] == "pdf"]
         chosen = (xbrl or pdf)[0]
 
-        # 3. Stáhnout se stejnou session (obsahuje cookies z předchozích požadavků)
-        r_file = client.get(chosen["url"], timeout=120)
-        r_file.raise_for_status()
-        data = r_file.content
-        ct = r_file.headers.get("content-type", "")
+        # 3. Stáhnout soubor v rámci stejné session (session cookie je nutná)
+        def _download(url: str) -> Tuple[bytes, str]:
+            r = client.get(url, timeout=120)
+            r.raise_for_status()
+            return r.content, r.headers.get("content-type", "")
 
-        # Ověřit, že nejsme na HTML chybové stránce (justice.cz throttling)
-        if "text/html" in ct and len(data) < 50_000:
-            if xbrl and pdf:
-                r_file = client.get(pdf[0]["url"], timeout=120)
-                r_file.raise_for_status()
-                data = r_file.content
-                ct = r_file.headers.get("content-type", "")
-                chosen = pdf[0]
-            else:
-                raise ValueError(
-                    "Justice.cz odmítlo stažení souboru (pravděpodobně throttling). Zkus znovu."
-                )
-
-        # Určit skutečný formát podle content-type a obsahu - ne podle jména souboru
+        data, ct = _download(chosen["url"])
         actual_fmt = _detect_format(data, ct, chosen["format"])
+
+        # Pokud jsme dostali HTML chybovou stránku, zkusit znovu s novou session
+        if actual_fmt == "html_error":
+            import time
+            time.sleep(2)
+            # Znovu načíst detail stránku pro refresh cookies a pak stáhnout
+            client.get(zaverka["detail_url"], timeout=30)
+            data, ct = _download(chosen["url"])
+            actual_fmt = _detect_format(data, ct, chosen["format"])
+
+        if actual_fmt == "html_error":
+            raise ValueError(
+                "Justice.cz odmítá stažení souboru (throttling nebo blokace). "
+                "Počkej chvíli a zkus znovu."
+            )
+
         return data, ct, actual_fmt
 
 
